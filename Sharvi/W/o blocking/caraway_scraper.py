@@ -123,7 +123,9 @@ SOURCE_OVERRIDES: dict[str, dict] = {
     # ---------------- Canada ----------------
     "https://www.pm.gc.ca/en/news": dict(
         strategy="listing", page_param="page", page_start=0, wayback_prefix="www.pm.gc.ca/en/news/",
-        link_pattern=r"/en/news/[^/]+/20\d\d/\d\d/\d\d/", notes="Drupal ?page=N"),
+        render_js=True,
+        link_pattern=r"/en/news/[^/]+/20\d\d/\d\d/\d\d/",
+        notes="JavaScript list: run with --js on your own computer."),
     "https://www.canada.ca/en/news/advanced-news-search": dict(
         strategy="listing", page_param="idx", page_start=0, page_step=10,
         fixed_params={"start": "{start}", "end": "{end}"},
@@ -701,6 +703,8 @@ class Fetcher:
     def get(self, url, max_age=None, render_js=False, when=None, allow_wayback=True) -> Page | None:
         url = normalize_url(url)
         cached = self._cache_get(url, max_age)
+        if cached is not None and render_js and not self.offline and cached.via == "cache:live":
+            cached = None
         if cached is not None:
             self.stats["cache_hits"] += 1
             self.last_reason.value = ""
