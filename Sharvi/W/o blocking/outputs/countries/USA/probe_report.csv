@@ -1,5 +1,5 @@
 country,type,url,strategy,enabled,notes,status,links_found,sample_links
-USA,Govt press release,https://www.state.gov/press-releases/,wayback,True,"Post-Jan-2025 releases. Blocks cloud IPs, so discovered via the Internet Archive.",no results (failed),0,
+USA,Govt press release,https://www.state.gov/press-releases/,wayback,True,"Post-Jan-2025 releases. Blocks cloud IPs, so discovered via the Internet Archive.",no results (empty),0,
 USA,Ministry of Environment,https://www.epa.gov/newsreleases/search,wayback,True,EPA blocks cloud IPs; discovered via the Internet Archive.,no results (http_503),0,
-USA,Govt press release,https://2021-2025.state.gov/,wayback,True,Archive of pre-2025 State pages; only pages whose URL slug contains a codeword are fetched.,no results (http_503),0,
+USA,Govt press release,https://2021-2025.state.gov/,wayback,True,Archive of pre-2025 State pages; only pages whose URL slug contains a codeword are fetched.,no results (failed),0,
 USA,Executive order / Presidential document,https://www.federalregister.gov/api/v1/documents.json,federal_register,True,"Official Federal Register API: executive orders, memoranda, proclamations.",no results (http_400),0,

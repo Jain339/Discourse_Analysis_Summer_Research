@@ -108,17 +108,18 @@ FEDREG_API = "https://www.federalregister.gov/api/v1/documents.json"
 SOURCE_OVERRIDES: dict[str, dict] = {
     # ---------------- USA (all three sites block cloud servers) ----------------
     "https://www.state.gov/": dict(
-        strategy="wayback", wayback_prefix="www.state.gov/releases/",
-        link_pattern=r"state\.gov/releases/[^?#]+/20\d\d/\d\d/[^/?#]+/?$",
-        notes="Post-Jan-2025 releases. Blocks cloud IPs, so discovered via the Internet Archive."),
+        strategy="listing", page_url_template="{base}page/{n}/", page_start=2,
+        wayback_prefix="www.state.gov/releases/",
+        link_pattern=r"state\.gov/(releases/[^?#]+/20\d\d/\d\d/[^/?#]+|[a-z0-9-]{25,})/?$",
+        notes="Live listing first; Internet Archive if blocked."),
     "https://2021-2025.state.gov/": dict(
-        strategy="wayback", wayback_prefix="2021-2025.state.gov/", slug_prefilter=True,
+        strategy="listing", page_url_template="{base}page/{n}/", page_start=2,
         link_pattern=r"2021-2025\.state\.gov/[a-z0-9-]{25,}/?$",
-        notes="Archive of pre-2025 State pages; only pages whose URL slug contains a codeword are fetched."),
+        notes="Archived State Dept site for pre-2025 releases."),
     "https://www.epa.gov/newsreleases": dict(
-        strategy="wayback", wayback_prefix="www.epa.gov/newsreleases/",
+        strategy="listing", page_param="page", page_start=0, wayback_prefix="www.epa.gov/newsreleases/",
         link_pattern=r"epa\.gov/newsreleases/[a-z0-9-]{12,}/?$",
-        notes="EPA blocks cloud IPs; discovered via the Internet Archive."),
+        notes="Live listing first; Internet Archive if blocked."),
     # ---------------- Canada ----------------
     "https://www.pm.gc.ca/en/news": dict(
         strategy="listing", page_param="page", page_start=0, wayback_prefix="www.pm.gc.ca/en/news/",
@@ -173,7 +174,7 @@ SOURCE_OVERRIDES: dict[str, dict] = {
 
 # Sources not in the sheet that Step 1 needs ("executive orders").
 EXTRA_SOURCES: list[dict] = [
-    dict(country="USA", source_type="Govt press release", url="https://2021-2025.state.gov/",
+    dict(country="USA", source_type="Govt press release", url="https://2021-2025.state.gov/press-releases/",
          notes="State Dept pages from before 20 Jan 2025 (not in the sheet)."),
     dict(country="USA", source_type="Executive order / Presidential document",
          url=FEDREG_API, strategy="federal_register",
@@ -615,10 +616,11 @@ class Fetcher:
             return "robots"
         netloc = urlparse(url).netloc
         reason = "failed"
-        for attempt in range(3):
+        tries = 5 if netloc.endswith("archive.org") else 3
+        for attempt in range(tries):
             self._throttle(netloc, self.delay * 2 if netloc.endswith("archive.org") else None)
             try:
-                r = self.session.get(url, timeout=40)
+                r = self.session.get(url, timeout=150 if netloc.endswith("archive.org") else 40)
             except requests.RequestException as e:
                 log.debug("error %s: %s", url, e)
                 time.sleep(2 ** attempt)
@@ -633,7 +635,7 @@ class Fetcher:
                 return Page(body, r.headers.get("content-type", "").lower(), via)
             if r.status_code in (202, 429, 500, 502, 503, 504):
                 reason = "blocked" if r.status_code in (202, 429) else f"http_{r.status_code}"
-                time.sleep(6 * (attempt + 1))
+                time.sleep((20 if netloc.endswith("archive.org") else 6) * (attempt + 1))
                 continue
             return "blocked" if looks_blocked(r.status_code, body) else f"http_{r.status_code}"
         return reason
@@ -914,14 +916,14 @@ def discover_auto(src, fetcher, start, end, max_pages):
         yield from discover_listing(src, fetcher, start, end, max_pages)
 
 
-def discover_wayback(src, fetcher, start, end, max_pages):
+def discover_wayback(src, fetcher, start, end, max_pages, cdx_limit=1500):
     """List every archived URL under wayback_prefix captured in the period (Internet Archive CDX API).
     Works for sites that block us, because we never contact the site itself."""
     prefix = src.wayback_prefix or (urlparse(src.url).netloc + urlparse(src.url).path.rsplit("/", 1)[0] + "/")
     resume, rows_seen = None, 0
     while True:
         params = {"url": prefix, "matchType": "prefix", "output": "json", "fl": "timestamp,original",
-                  "filter": "statuscode:200", "collapse": "urlkey", "limit": "5000", "showResumeKey": "true",
+                  "filter": "statuscode:200", "collapse": "urlkey", "limit": str(cdx_limit), "showResumeKey": "true",
                   "from": start.strftime("%Y%m%d"),
                   "to": (end + dt.timedelta(days=45)).strftime("%Y%m%d")}
         if resume:
@@ -929,7 +931,8 @@ def discover_wayback(src, fetcher, start, end, max_pages):
         url = f"{WAYBACK}/cdx/search/cdx?" + urlencode(params)
         page = fetcher.get(url, max_age=7 * DAY, allow_wayback=False)
         if not page:
-            log.warning("  Internet Archive CDX failed for %s (%s)", prefix, fetcher.last_reason.value)
+            log.warning("  Internet Archive is not responding for %s (%s). It is often overloaded: "
+                        "try again later; pages already listed are cached.", prefix, fetcher.last_reason.value)
             return
         try:
             rows = json.loads(page.text or "[]")
@@ -1000,30 +1003,38 @@ def discover_hk_daily(src, fetcher, start, end, max_pages):
         d += dt.timedelta(days=1)
 
 
+FEDREG_FIELDS = ("title", "html_url", "raw_text_url", "signing_date", "publication_date", "document_number")
+
+
 def discover_federal_register(src, fetcher, start, end, max_pages):
-    """US presidential documents (executive orders etc.) from the official Federal Register API."""
-    params = [("per_page", "100"), ("order", "oldest"), ("conditions[type][]", "PRESDOCU"),
-              ("conditions[publication_date][gte]", start.isoformat()),
-              ("conditions[publication_date][lte]", (end + dt.timedelta(days=21)).isoformat())]
-    params += [("conditions[presidential_document_type][]", t) for t in FEDREG_DOC_TYPES]
-    params += [("fields[]", f) for f in ("title", "html_url", "raw_text_url", "signing_date",
-                                        "publication_date", "presidential_document_type", "document_number")]
-    url = src.url + "?" + urlencode(params)
-    for _ in range(max_pages):
+    """US presidential documents (executive orders etc.) from the official Federal Register API.
+    One query per document type, so the type is known without relying on extra fields."""
+    for doc_type in FEDREG_DOC_TYPES:
+        label = "Executive order" if doc_type == "executive_order" else f"Presidential {doc_type.replace('_', ' ')}"
+        base = [("per_page", "100"), ("order", "oldest"), ("conditions[type][]", "PRESDOCU"),
+                ("conditions[presidential_document_type]", doc_type),
+                ("conditions[publication_date][gte]", start.isoformat()),
+                ("conditions[publication_date][lte]", (end + dt.timedelta(days=21)).isoformat())]
+        url = src.url + "?" + urlencode(base + [("fields[]", f) for f in FEDREG_FIELDS])
         page = fetcher.get(url, max_age=DAY, allow_wayback=False)
-        if not page:
-            break
-        data = json.loads(page.text)
-        for r in data.get("results", []):
-            d = iso_date(r.get("signing_date")) or iso_date(r.get("publication_date"))
-            kind = (r.get("presidential_document_type") or "").replace("_", " ").capitalize()
-            yield Candidate(r["html_url"], r.get("title", ""), d, "day",
-                            "signing date" if r.get("signing_date") else "publication date",
-                            fetch_url=r.get("raw_text_url") or r["html_url"],
-                            doc_type={"Executive order": "Executive order"}.get(kind, f"Presidential {kind.lower()}"))
-        url = data.get("next_page_url")
-        if not url:
-            break
+        if not page and fetcher.last_reason.value == "http_400":  # API rejected a field: use its defaults
+            log.info("  Federal Register rejected the field list; retrying with default fields")
+            url = src.url + "?" + urlencode(base)
+            page = fetcher.get(url, max_age=DAY, allow_wayback=False)
+        for _ in range(max_pages):
+            if not page:
+                log.warning("  Federal Register query failed for %s (%s)", doc_type, fetcher.last_reason.value)
+                break
+            data = json.loads(page.text)
+            for r in data.get("results", []):
+                d = iso_date(r.get("signing_date")) or iso_date(r.get("publication_date"))
+                yield Candidate(r["html_url"], r.get("title", ""), d, "day",
+                                "signing date" if r.get("signing_date") else "publication date",
+                                fetch_url=r.get("raw_text_url") or r["html_url"], doc_type=label)
+            nxt = data.get("next_page_url")
+            if not nxt:
+                break
+            page = fetcher.get(nxt, max_age=DAY, allow_wayback=False)
 
 
 def discover_manual(src, fetcher, start, end, max_pages):
@@ -1169,7 +1180,12 @@ def probe(sources, fetcher, start, end, out_path: Path):
         if not src.enabled:
             row.update(status="disabled", links_found=0)
         elif src.strategy in ("govuk_api", "hk_daily", "federal_register", "wayback", "manual"):
-            gen = STRATEGIES[src.strategy](src, fetcher, start, min(end, start + dt.timedelta(days=40)), 1)
+            if src.strategy == "wayback":
+                gen = discover_wayback(src, fetcher, start, end, 1, cdx_limit=50)
+            elif src.strategy == "hk_daily":
+                gen = discover_hk_daily(src, fetcher, start, min(end, start + dt.timedelta(days=5)), 1)
+            else:
+                gen = STRATEGIES[src.strategy](src, fetcher, start, end, 1)
             sample = [c for _, c in zip(range(5), gen)]
             row.update(status="ok" if sample else f"no results ({fetcher.last_reason.value or 'empty'})",
                        links_found=len(sample), sample_links=" | ".join(c.url for c in sample[:3]))

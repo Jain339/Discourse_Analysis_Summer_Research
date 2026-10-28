@@ -1,0 +1,6 @@
+# page caches: large, rebuildable, keep them on the machine that made them
+cache/
+*.sqlite
+.venv/
+__pycache__/
+.ipynb_checkpoints/
