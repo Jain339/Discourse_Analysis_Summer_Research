@@ -110,11 +110,11 @@ SOURCE_OVERRIDES: dict[str, dict] = {
     "https://www.state.gov/": dict(
         strategy="listing", page_url_template="{base}page/{n}/", page_start=2,
         wayback_prefix="www.state.gov/releases/",
-        link_pattern=r"state\.gov/(releases/[^?#]+/20\d\d/\d\d/[^/?#]+|[a-z0-9-]{25,})/?$",
+        link_pattern=r"state\.gov/(releases/([^?#]+/)?20\d\d/\d\d/[^/?#]+|[a-z0-9-]{25,})/?$",
         notes="Live listing first; Internet Archive if blocked."),
     "https://2021-2025.state.gov/": dict(
         strategy="listing", page_url_template="{base}page/{n}/", page_start=2,
-        link_pattern=r"2021-2025\.state\.gov/[a-z0-9-]{25,}/?$",
+        link_pattern=r"2021-2025\.state\.gov/((office-of-the-spokesperson/)?releases/([^?#]+/)?20\d\d/\d\d/[^/?#]+|[a-z0-9.-]{25,})/?$",
         notes="Archived State Dept site for pre-2025 releases."),
     "https://www.epa.gov/newsreleases": dict(
         strategy="listing", page_param="page", page_start=0, wayback_prefix="www.epa.gov/newsreleases/",
@@ -538,7 +538,7 @@ def normalize_url(url: str) -> str:
 
 
 def looks_blocked(status: int, body: bytes) -> bool:
-    if status in (401, 403, 406, 429, 202):
+    if status in (401, 403, 405, 406, 429, 202):
         return True
     head = body[:8000].decode("utf-8", "replace")
     return len(body) < 60000 and bool(BLOCK_MARKERS.search(head))
@@ -1200,7 +1200,14 @@ def probe(sources, fetcher, start, end, out_path: Path):
                            wayback_fallback="yes" if src.wayback_prefix else "no (add wayback_prefix)")
             else:
                 links = extract_links(page.text, first, src)
-                row.update(status="ok" if links else "0 article links: check link_pattern / JS",
+                status = "ok"
+                if not links:  # keep what the site actually sent, to see if it was a bot check
+                    snap = out_path.parent / f"probe_{slug(src.site)}.html"
+                    snap.write_bytes(page.body)
+                    t = BeautifulSoup(page.text, "lxml").title
+                    status = (f"0 article links (page title: '{(t.get_text(strip=True) if t else '')[:60]}', "
+                              f"{len(page.body)//1024} KB, saved as {snap.name}). Try --js --browser chrome")
+                row.update(status=status,
                            links_found=len(links), dated_links=sum(bool(c.date) for c in links),
                            has_next_link=bool(find_next_link(page.text, first)),
                            sample_links=" | ".join(c.url for c in links[:3]))
@@ -1490,8 +1497,9 @@ def main(argv=None):
     fetcher = Fetcher(Path("cache") / f"{slug(country)}.sqlite", args.delay, offline=args.offline, use_js=args.js,
                       browser=args.browser, headed=args.headed, wayback=not args.no_wayback, email=args.email)
     try:
-        if args.probe:
-            return probe(srcs, fetcher, start, end, out_dir / "probe_report.csv")
+        if args.probe:  # in its own thread: Playwright cannot start inside Jupyter's event loop
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(probe, srcs, fetcher, start, end, out_dir / "probe_report.csv").result()
         records, source_rows = [], []
         active = [s for s in srcs if s.enabled]
         source_rows += [{**vars(s), "error_msg": "disabled"} for s in srcs if not s.enabled]
