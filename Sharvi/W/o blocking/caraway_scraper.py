@@ -537,11 +537,35 @@ def normalize_url(url: str) -> str:
     return urlunparse((p.scheme, p.netloc.lower(), p.path, "", urlencode(q), ""))
 
 
+BLOCK_TITLES = re.compile(
+    r"<title[^>]*>[^<]{0,40}(technical difficulties|human verification|access denied|just a moment|"
+    r"attention required|request rejected|pardon our interruption|are you a robot|security check|"
+    r"bot (check|protection)|verify you are human|checking your browser)", re.I)
+
+
 def looks_blocked(status: int, body: bytes) -> bool:
     if status in (401, 403, 405, 406, 429, 202):
         return True
-    head = body[:8000].decode("utf-8", "replace")
-    return len(body) < 60000 and bool(BLOCK_MARKERS.search(head))
+    head = body[:20000].decode("utf-8", "replace")
+    if BLOCK_TITLES.search(head):
+        return True
+    return len(body) < 60000 and bool(BLOCK_MARKERS.search(head[:8000]))
+
+
+def _start_playwright(sync_playwright):
+    """On Windows, Jupyter switches asyncio to a 'selector' loop that cannot launch programs, so
+    Playwright fails with NotImplementedError. Use the normal Windows (Proactor) loop while it starts."""
+    import asyncio, sys, warnings
+    if sys.platform != "win32":
+        return sync_playwright().start()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        old = asyncio.get_event_loop_policy()
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        try:
+            return sync_playwright().start()
+        finally:
+            asyncio.set_event_loop_policy(old)
 
 
 class Fetcher:
@@ -643,7 +667,7 @@ class Fetcher:
     def _render_js(self, url):
         if not hasattr(self._js, "browser"):
             from playwright.sync_api import sync_playwright  # optional dependency
-            pw = sync_playwright().start()
+            pw = _start_playwright(sync_playwright)
             kw = {"headless": not self.headed}
             if self.browser_channel in ("chrome", "msedge"):
                 kw["channel"] = self.browser_channel  # your installed Chrome / Edge
@@ -847,10 +871,13 @@ def discover_listing(src, fetcher, start, end, max_pages):
     for i in range(max_pages):
         page = fetcher.get(url, max_age=DAY, render_js=src.render_js, allow_wayback=False)
         if not page:
-            if i == 0 and src.wayback_prefix and fetcher.wayback:
-                log.info("  %s listing blocked (%s); switching to Internet Archive discovery",
+            if i == 0 and fetcher.wayback:
+                log.info("  %s listing blocked (%s); reading the Internet Archive's copies of the listing pages",
                          src.site, fetcher.last_reason.value)
-                yield from discover_wayback(src, fetcher, start, end, max_pages)
+                yield from discover_listing_archived(src, fetcher, start, end, max_pages)
+                if src.wayback_prefix:
+                    log.info("  %s: also searching the Internet Archive index", src.site)
+                    yield from discover_wayback(src, fetcher, start, end, max_pages)
             break
         cands = [c for c in extract_links(page.text, url, src) if c.url not in seen]
         if not cands:
@@ -873,6 +900,43 @@ def discover_listing(src, fetcher, start, end, max_pages):
         if not nxt or nxt in seen:
             break
         url = nxt
+
+
+def archived(url: str, when: dt.date) -> str:
+    """Raw Internet Archive copy of url, nearest to the date `when`."""
+    return f"{WAYBACK}/web/{when:%Y%m%d}id_/{url}"
+
+
+def discover_listing_archived(src, fetcher, start, end, max_pages, max_misses=3):
+    """Same as discover_listing, but every listing page is read from the Internet Archive.
+    Complete for frozen sites (e.g. 2021-2025.state.gov); partial for live sites."""
+    seen, misses, found = set(), 0, 0
+    paginated = bool(src.page_param or src.page_url_template)
+    url = page_url(src, 0, start, end)
+    for i in range(max_pages):
+        page = fetcher.get(archived(url, end), max_age=7 * DAY, allow_wayback=False)
+        cands = [c for c in extract_links(page.text, url, src) if c.url not in seen] if page else []
+        if not cands:
+            misses += 1
+            if misses >= max_misses or not paginated:
+                break
+        else:
+            misses = 0
+            for c in cands:
+                seen.add(c.url)
+                found += 1
+                yield c
+            dated = [c for c in cands if c.date]
+            if dated and all(outside_range(c.date, c.precision, start, dt.date.max) for c in dated):
+                break
+        if paginated:
+            url = page_url(src, i + 1, start, end)
+        else:
+            nxt = find_next_link(page.text, url) if page else None
+            if not nxt or nxt in seen:
+                break
+            url = nxt
+    log.info("  %s: %d links from archived listing pages", src.site, found)
 
 
 def _parse_sitemap(xml):
@@ -1194,10 +1258,17 @@ def probe(sources, fetcher, start, end, out_path: Path):
             page = fetcher.get(first, max_age=DAY, render_js=src.render_js, allow_wayback=False)
             if not page:
                 reason = fetcher.last_reason.value
-                hint = {"blocked": "BLOCKED: run on your own computer / --js; Wayback fallback will be used",
-                        "needs_js": "needs --js (JavaScript site)", "robots": "disallowed by robots.txt"}
-                row.update(status=hint.get(reason, f"fetch failed ({reason})"), links_found=0,
-                           wayback_fallback="yes" if src.wayback_prefix else "no (add wayback_prefix)")
+                arch = fetcher.get(archived(first, end), max_age=7 * DAY, allow_wayback=False) if fetcher.wayback else None
+                alinks = extract_links(arch.text, first, src) if arch else []
+                if alinks:
+                    status = f"BLOCKED live, but the Internet Archive copy works ({len(alinks)} links on page 1)"
+                else:
+                    status = {"blocked": "BLOCKED live and no usable archive copy of the listing",
+                              "needs_js": "needs --js (JavaScript site)",
+                              "robots": "disallowed by robots.txt"}.get(reason, f"fetch failed ({reason})")
+                    if src.wayback_prefix:
+                        status += "; the full run will also search the archive index"
+                row.update(status=status, links_found=len(alinks), sample_links=" | ".join(c.url for c in alinks[:3]))
             else:
                 links = extract_links(page.text, first, src)
                 status = "ok"
