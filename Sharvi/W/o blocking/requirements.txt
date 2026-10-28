@@ -1,0 +1,9 @@
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+trafilatura>=1.12
+pandas>=2.0
+openpyxl>=3.1
+pypdf>=4.0
+# Only needed for --js (JavaScript sites / real-browser fallback), on your own computer:
+playwright>=1.44
