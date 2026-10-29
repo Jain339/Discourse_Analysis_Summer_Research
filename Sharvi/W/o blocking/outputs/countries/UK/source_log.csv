@@ -1,0 +1,2 @@
+country,source_type,url,strategy,enabled,candidates,fetched_articles,kept,blocked,via_wayback,skipped_out_of_range,skipped_title_prefilter,dropped_out_of_range,dropped_empty_text,dropped_no_keywords,fetch_needs_js,fetch_failed,error_msg,notes
+UK,Ministry of Environment,https://www.gov.uk/search/news-and-communications?organisations[]=environment-agency&parent=environment-agency,govuk_api,True,957,957,956,,,,,,,1,,,,GOV.UK Search API
