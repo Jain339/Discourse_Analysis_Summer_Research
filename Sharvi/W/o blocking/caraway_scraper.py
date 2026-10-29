@@ -123,9 +123,7 @@ SOURCE_OVERRIDES: dict[str, dict] = {
     # ---------------- Canada ----------------
     "https://www.pm.gc.ca/en/news": dict(
         strategy="listing", page_param="page", page_start=0, wayback_prefix="www.pm.gc.ca/en/news/",
-        render_js=True,
-        link_pattern=r"/en/news/[^/]+/20\d\d/\d\d/\d\d/",
-        notes="JavaScript list: run with --js on your own computer."),
+        link_pattern=r"/en/news/[^/]+/20\d\d/\d\d/\d\d/", notes="Drupal ?page=N"),
     "https://www.canada.ca/en/news/advanced-news-search": dict(
         strategy="listing", page_param="idx", page_start=0, page_step=10,
         fixed_params={"start": "{start}", "end": "{end}"},
@@ -599,7 +597,13 @@ class Fetcher:
         with self.lock:
             row = self.db.execute("SELECT fetched, ctype, via, body FROM pages2 WHERE url=?", (url,)).fetchone()
         if row and (max_age is None or self.offline or time.time() - row[0] < max_age):
-            return Page(zlib.decompress(row[3]), row[1] or "", "cache:" + (row[2] or ""))
+            body = zlib.decompress(row[3])
+            if looks_blocked(200, body):  # a bot page saved by an older version: discard it
+                with self.lock:
+                    self.db.execute("DELETE FROM pages2 WHERE url=?", (url,))
+                    self.db.commit()
+                return None
+            return Page(body, row[1] or "", "cache:" + (row[2] or ""))
         return None
 
     def _cache_put(self, url, page: Page):
@@ -703,8 +707,6 @@ class Fetcher:
     def get(self, url, max_age=None, render_js=False, when=None, allow_wayback=True) -> Page | None:
         url = normalize_url(url)
         cached = self._cache_get(url, max_age)
-        if cached is not None and render_js and not self.offline and cached.via == "cache:live":
-            cached = None
         if cached is not None:
             self.stats["cache_hits"] += 1
             self.last_reason.value = ""
@@ -852,19 +854,53 @@ PAGINATION_GUESSES = [  # (page_param, page_start) or template; tried when a pag
 ]
 
 
-def guess_pagination(src, fetcher, first_links, start, end):
+PAGE_NAME_RE = re.compile(r"(?:[?&;]|name=[\"'])((?:[a-z]+_)?(?:page|pg|cpage|curpage|currentpage|pageindex|pageno|pagenum|"
+                          r"page_no|pagenumber|nowpage|startpage|pager\w*|offset|firstindex|startcount)\w*)(?:=\d|[\"'])", re.I)
+OFFSET_NAME = re.compile(r"offset|firstindex|startcount|start$|^idx$|row", re.I)
+COMMON_PAGE_NAMES = ["pageIndex", "currentPage", "pageNo", "cpage", "curPage", "pageNum", "nowPage", "pg"]
+
+
+def html_pagination_guesses(html: str, per_page: int = 10) -> list[dict]:
+    """Page-number parameter names found in the page itself (links, hidden form fields),
+    plus names common on government board software when pages are changed by JavaScript."""
+    names = []
+    for m in PAGE_NAME_RE.finditer(html or ""):
+        n = m.group(1)
+        if n.lower() not in {x.lower() for x in names} and len(n) <= 20:
+            names.append(n)
+    if re.search(r"(fn_egov_link_page|linkPage|goPage|fnGoPage|movePage|fn_link_page|pageMove|goList)\s*\(", html or "", re.I):
+        names += [n for n in COMMON_PAGE_NAMES if n.lower() not in {x.lower() for x in names}]
+    out = []
+    for n in names:
+        if OFFSET_NAME.search(n):  # counts posts, not pages: jump a whole page at a time
+            out += [dict(page_param=n, page_start=0, page_step=k) for k in dict.fromkeys((per_page, 10, 20))]
+        else:
+            out += [dict(page_param=n, page_start=st) for st in (1, 0)]
+    return out
+
+
+def guess_pagination(src, fetcher, first_links, start, end, first_html=""):
     known = {c.url for c in first_links}
-    for g in PAGINATION_GUESSES:
+    tried = set()
+    for g in html_pagination_guesses(first_html, max(len(first_links), 1)) + PAGINATION_GUESSES:
+        key = tuple(sorted(g.items()))
+        if key in tried:
+            continue
+        tried.add(key)
         trial = replace(src, **g)
         url = page_url(trial, 1, start, end)
         if normalize_url(url) == normalize_url(page_url(src, 0, start, end)):
             continue
         page = fetcher.get(url, max_age=DAY, render_js=src.render_js, allow_wayback=False)
         if page and not page.is_pdf:
-            new = [c for c in extract_links(page.text, url, src) if c.url not in known]
-            if len(new) >= 3:
+            links = extract_links(page.text, url, src)
+            new = [c for c in links if c.url not in known]
+            if len(new) >= 3 and len(new) >= 0.6 * len(links):
                 log.info("  %s: pagination detected (%s)", src.site, g)
                 return trial
+    log.warning("  %s: could not find how to reach page 2, so only the first page was read. "
+                "Open the site, click page 2, and set page_param for it in SOURCE_OVERRIDES (README section 5).",
+                src.site)
     return None
 
 
@@ -897,7 +933,7 @@ def discover_listing(src, fetcher, start, end, max_pages):
             continue
         nxt = find_next_link(page.text, url)
         if not nxt and i == 0:
-            guessed = guess_pagination(src, fetcher, cands, start, end)
+            guessed = guess_pagination(src, fetcher, cands, start, end, page.text)
             if guessed:
                 src, paginated = guessed, True
                 nxt = page_url(src, 1, start, end)
