@@ -52,7 +52,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib import robotparser
-from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import pandas as pd
 import requests
@@ -136,8 +136,11 @@ SOURCE_OVERRIDES: dict[str, dict] = {
         link_pattern=r"environment\.ec\.europa\.eu/news/[^/?#]+-20\d\d-\d\d-\d\d_en$",
         notes="?page=N is zero-based; date is in the URL slug"),
     "https://ec.europa.eu/commission/presscorner": dict(
-        render_js=True, link_pattern=r"presscorner/detail/en/(ip|statement|speech|qanda)_\d\d_\d+",
-        notes="JavaScript app: run with --js on your own computer."),
+        render_js=True, title_prefilter=True,
+        link_pattern=r"presscorner/detail/en/(ip|statement|speech|qanda|jp)_\d\d_\d+$",
+        strategy="js_clicks", fixed_params={"datefrom": "{start_dmy}", "dateto": "{end_dmy}"},
+        notes="JavaScript app (--js). Date-filtered list read by clicking through its pages; "
+              "only items whose title matches a codeword are opened."),
     # ---------------- China ----------------
     "https://english.mee.gov.cn/": dict(
         strategy="listing", page_url_template="{base}index_{n}.shtml", page_start=1,
@@ -150,7 +153,9 @@ SOURCE_OVERRIDES: dict[str, dict] = {
         link_pattern=r"beehive\.govt\.nz/release/[^/?#]+$", notes="?page=N zero-based, ~10 per page"),
     "https://www.dpmc.govt.nz/": dict(wayback_prefix="www.dpmc.govt.nz/news/"),
     # ---------------- Singapore ----------------
-    "https://www.sgpc.gov.sg": dict(render_js=True, notes="JavaScript-rendered: run with --js"),
+    "https://www.sgpc.gov.sg": dict(
+        render_js=True, link_pattern=r"sgpc\.gov\.sg/detail\?url=/?media_releases/[^&]+/[PS]-20\d{6}-\d+",
+        notes="JavaScript site (--js). Home page shows only the newest releases; older ones via manual_urls/Singapore.csv"),
     "https://www.mse.gov.sg/latest-news": dict(
         link_pattern=r"mse\.gov\.sg/latest-news/[^/?#]{12,}/?$", notes="pagination guessed automatically"),
     # ---------------- Hong Kong ----------------
@@ -165,7 +170,19 @@ SOURCE_OVERRIDES: dict[str, dict] = {
     "https://www.epd.gov.hk/": dict(allowed_domains=["info.gov.hk"]),
     # ---------------- India ----------------
     "https://www.pib.gov.in/": dict(
-        enabled=False, notes="ASP.NET forms: collect links into manual_urls/India.csv (see README)."),
+        enabled=False, notes="Covered by the Allrel.aspx source (all ministries' releases)."),
+    "https://www.pib.gov.in/Allrel.aspx": dict(
+        enabled=True, strategy="pib_form",
+        link_pattern=r"pib\.gov\.in/PressReleaseDetail\.aspx\?PRID=\d+",
+        # ministry number (from PIB's ministry drop-down): True = open only releases whose
+        # TITLE matches a codeword (for big ministries where most releases are off-topic)
+        options={"ministries": {"30": False,   # Environment, Forest and Climate Change
+                                "28": False,   # New and Renewable Energy
+                                "52": True,    # Power
+                                "4": True,     # External Affairs
+                                "15": True,    # Finance
+                                "3": True}},   # Prime Minister's Office
+        notes="PIB: the browser picks each ministry and month in the form (--js)."),
     "https://moef.gov.in/": dict(wayback_prefix="moef.gov.in/"),
     # ---------------- South Korea ----------------
     "https://mcee.go.kr/": dict(link_pattern=r"mcee\.go\.kr/.*(boardId|seq|articleId|nttId)=\d+",
@@ -206,6 +223,7 @@ class Source:
     enabled: bool = True
     notes: str = ""
     manual_rows: list = field(default_factory=list, repr=False)
+    options: dict = field(default_factory=dict)  # site-specific settings (e.g. PIB ministries)
 
     @property
     def site(self) -> str:
@@ -221,6 +239,7 @@ class Candidate:
     date_source: str = ""
     fetch_url: str | None = None  # where to get the text if different from url
     doc_type: str = ""
+    prefilter: bool = False  # only open it if its title matches a codeword
 
 
 @dataclass
@@ -282,6 +301,12 @@ def _find_col(columns, *prefixes):
         if any(str(c).strip().lower().startswith(p) for p in prefixes):
             return c
     return None
+
+
+def url_needs_js(url: str) -> bool:
+    """True if this URL belongs to a site configured as JavaScript-rendered (e.g. manual-list links)."""
+    best = max((p for p in SOURCE_OVERRIDES if url.startswith(p)), key=len, default=None)
+    return bool(best and SOURCE_OVERRIDES[best].get("render_js"))
 
 
 def apply_overrides(src: Source) -> Source:
@@ -433,10 +458,11 @@ def iso_date(s) -> dt.date | None:
 
 
 def date_from_url(url: str):
-    path = urlparse(url).path
+    p = urlparse(url)
+    path = p.path + ("?" + unquote(p.query) if "url=" in p.query else "")
     for rx in (r"(?<!\d)(20\d{2})[/-](\d{2})[/-](\d{2})(?!\d)",
                r"(?<!\d)(20\d{2})(\d{2})/(\d{2})(?!\d)",
-               r"(?<![\dA-Za-z])[tPU]?0?(20\d{2})(\d{2})(\d{2})(?=[_\d])"):
+               r"(?<![\dA-Za-z])[tPUS]?-?0?(20\d{2})(\d{2})(\d{2})(?=[_\d-])"):
         m = re.search(rx, path)
         if m and (d := _mkdate(*m.groups())):
             return d, "day"
@@ -509,10 +535,21 @@ DOC_TYPE_RULES = [
 ]
 
 
+EC_CODES = {"ip": "Press release", "statement": "Joint / ministerial statement", "speech": "Speech / remarks",
+            "qanda": "Q&A / factsheet", "jp": "Joint / ministerial statement"}
+
+
 def classify_doc_type(title: str, url: str, source_type: str, hint: str = "") -> str:
     if hint:
         return hint
-    hay = f"{title} {urlparse(url).path.replace('-', ' ').replace('_', ' ')}"
+    m = re.search(r"presscorner/detail/\w+/([a-z]+)_\d\d_\d+", url)  # EU press corner states the type
+    if m and m.group(1) in EC_CODES:
+        return EC_CODES[m.group(1)]
+    m = re.search(r"media_releases(?:/|%2F)[^/%]+(?:/|%2F)(press_release|speech)", url)  # Singapore SGPC
+    if m:
+        return "Speech / remarks" if m.group(1) == "speech" else "Press release"
+    u = urlparse(url)
+    hay = f"{title} {(u.path + ' ' + unquote(u.query)).replace('-', ' ').replace('_', ' ').replace('/', ' ')}"
     for label, rx in DOC_TYPE_RULES:
         if re.search(rx, hay, re.I):
             return label
@@ -670,7 +707,7 @@ class Fetcher:
             return "blocked" if looks_blocked(r.status_code, body) else f"http_{r.status_code}"
         return reason
 
-    def _render_js(self, url):
+    def _browser(self):
         if not hasattr(self._js, "browser"):
             from playwright.sync_api import sync_playwright  # optional dependency
             pw = _start_playwright(sync_playwright)
@@ -679,6 +716,13 @@ class Fetcher:
                 kw["channel"] = self.browser_channel  # your installed Chrome / Edge
             self._js.pw, self._js.browser = pw, pw.chromium.launch(**kw)
             self._browsers.append((pw, self._js.browser))
+        return self._js.browser
+
+    def new_browser_page(self):
+        return self._browser().new_page()
+
+    def _render_js(self, url):
+        self._browser()
         if not self.allowed(url):
             return "robots"
         self._throttle(urlparse(url).netloc, max(self.delay, 3))
@@ -769,7 +813,7 @@ def looks_like_article(url, src: Source, listing_url: str) -> bool:
     if SKIP_ANY.search(url) and not url.lower().endswith(".pdf"):
         return False
     if src.link_pattern:
-        return re.search(src.link_pattern, url) is not None
+        return re.search(src.link_pattern, unquote(url)) is not None
     p = urlparse(url)
     if normalize_url(url) == normalize_url(listing_url) or SKIP_PATH.search(p.path) or SKIP_EXT.search(p.path):
         return False
@@ -782,6 +826,9 @@ def looks_like_article(url, src: Source, listing_url: str) -> bool:
 def extract_links(html, page_url, src: Source) -> list[Candidate]:
     soup = BeautifulSoup(html, "lxml")
     out, seen = [], set()
+    base_tag = soup.find("base", href=True)  # <base href> changes what relative links point to
+    if base_tag:
+        page_url = urljoin(page_url, base_tag["href"])
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         if href.startswith(("#", "mailto:", "javascript:", "tel:")):
@@ -798,12 +845,12 @@ def extract_links(html, page_url, src: Source) -> list[Candidate]:
         dsrc = "url" if d else ""
         if not d:
             node = a
-            for _ in range(3):
+            for _ in range(4):
                 node = node.parent
                 if node is None:
                     break
                 txt = node.get_text(" ", strip=True)
-                if len(txt) > 400:
+                if len(txt) > 600:
                     break
                 if (d := date_from_text(txt)):
                     prec, dsrc = "day", "listing page"
@@ -834,7 +881,9 @@ def _with_params(url, params):
 
 
 def page_url(src: Source, i, start, end):
-    fixed = {k: v.format(start=start.isoformat(), end=end.isoformat()) for k, v in src.fixed_params.items()}
+    fixed = {k: v.format(start=start.isoformat(), end=end.isoformat(),
+                         start_dmy=start.strftime("%d%m%Y"), end_dmy=end.strftime("%d%m%Y"))
+             for k, v in src.fixed_params.items()}
     base = _with_params(src.url, fixed) if fixed else src.url
     if src.page_url_template:
         if i == 0:
@@ -1151,7 +1200,215 @@ def discover_manual(src, fetcher, start, end, max_pages):
                         "manual list" if d else "")
 
 
-STRATEGIES = {"auto": discover_auto, "listing": discover_listing, "govuk_api": discover_govuk,
+def _wait_stable(page, url, src, polls=40):
+    """Wait until the number of article links on the page stops changing (max ~20 s)."""
+    prev, steady = -1, 0
+    for _ in range(polls):
+        n = len(extract_links(page.content(), url, src))
+        steady = steady + 1 if (n == prev and n > 0) else 0
+        if steady >= 3:
+            return n
+        prev = n
+        page.wait_for_timeout(500)
+    return prev
+
+
+def _dismiss_cookies(page):
+    """Choose 'essential cookies only' (or close the banner) so it cannot cover the page buttons."""
+    import re as _re
+    for name in (r"only essential", r"reject (all|optional)", r"decline", r"accept only"):
+        try:
+            b = page.get_by_role("button", name=_re.compile(name, _re.I))
+            if not b.count():
+                b = page.get_by_role("link", name=_re.compile(name, _re.I))
+            if b.count() and b.first.is_visible():
+                b.first.click()
+                page.wait_for_timeout(800)
+                return
+        except Exception:
+            continue
+
+
+def _click_next(page, current: int) -> bool:
+    """Click the control for page current+1 (or a 'Next' control). True if something was clicked."""
+    import re as _re
+    tries = [page.get_by_role("link", name=str(current + 1), exact=True),
+             page.get_by_role("button", name=str(current + 1), exact=True),
+             page.locator("nav a, nav button, [class*=pag] a, [class*=pag] button").filter(
+                 has_text=_re.compile(rf"^\s*{current + 1}\s*$")),
+             page.get_by_role("link", name=_re.compile(r"^\s*next", _re.I)),
+             page.get_by_role("button", name=_re.compile(r"^\s*next", _re.I)),
+             page.locator("[aria-label*=Next i], [title*=Next i]")]
+    for loc in tries:
+        try:
+            if loc.count() and loc.first.is_visible():
+                loc.first.scroll_into_view_if_needed()
+                loc.first.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def month_windows(start: dt.date, end: dt.date):
+    """(first day, last day) of each calendar month between start and end, newest first."""
+    out, d = [], start.replace(day=1)
+    while d <= end:
+        out.append((max(d, start), min(month_end(d), end)))
+        d = month_end(d) + dt.timedelta(days=1)
+    return out[::-1]
+
+
+def _click_through(src, fetcher, url, start, max_pages, status):
+    """Open url in the browser and read it page by page by clicking the page numbers.
+    status["complete"] is set True only if the end of the list was reached normally."""
+    page = fetcher.new_browser_page()
+    seen, n = set(), 1
+    try:
+        fetcher._throttle(urlparse(url).netloc, max(fetcher.delay, 3))
+        page.goto(url, wait_until="networkidle", timeout=90000)
+        _dismiss_cookies(page)
+        _wait_stable(page, url, src)  # the list is often drawn a moment after the page "loads"
+        while n <= max_pages:
+            html = page.content()
+            if looks_blocked(200, html.encode("utf-8")):
+                log.warning("  %s: bot check on page %d; stopping", src.site, n)
+                return
+            links = extract_links(html, url, src)
+            for c in links:
+                if c.url not in seen:
+                    seen.add(c.url)
+                    yield c
+            fetcher._throttle(urlparse(url).netloc, max(fetcher.delay, 3))
+            if not _click_next(page, n):
+                status["complete"] = True  # no further page: end of this list
+                return
+            for _ in range(40):  # wait until links we have not seen appear (fixed boxes like
+                page.wait_for_timeout(500)  # "Top stories" stay the same on every page)
+                if any(c.url not in seen for c in extract_links(page.content(), url, src)):
+                    _wait_stable(page, url, src)  # let the rest of the new page finish drawing
+                    break
+            else:
+                snap = Path("outputs") / f"debug_{slug(src.site)}_page{n + 1}.html"
+                snap.parent.mkdir(parents=True, exist_ok=True)
+                snap.write_text(page.content(), encoding="utf-8")
+                log.warning("  %s: list did not change after clicking page %d (page saved as %s); "
+                            "this month may be incomplete", src.site, n + 1, snap)
+                return
+            n += 1
+    finally:
+        status["pages"], status["links"] = n, len(seen)
+        page.close()
+
+
+def discover_js_clicks(src, fetcher, start, end, max_pages):
+    """For lists whose pages change by JavaScript without changing the address (e.g. EU press corner).
+    The list is searched ONE MONTH AT A TIME (such sites stop at ~100 pages per search), and each
+    finished month is remembered in the cache, so an interrupted run does not click through it again."""
+    if not fetcher.use_js:
+        log.warning("  %s needs --js (pages are changed by clicking in a browser)", src.site)
+        fetcher.last_reason.value = "needs_js"
+        return
+    for a, b in month_windows(start, end):
+        url = page_url(src, 0, a, b)
+        key = "jsclick://" + url
+        done = fetcher._cache_get(key, None)
+        if done is not None:  # this month was finished in an earlier run
+            for d in json.loads(done.text):
+                yield Candidate(d["url"], d["title"], iso_date(d["date"]), d["precision"], d["date_source"])
+            continue
+        status, found = {"complete": False}, []
+        for c in _click_through(src, fetcher, url, a, max_pages, status):
+            found.append(c)
+            yield c
+        log.info("  %s %s: %d list pages, %d links%s", src.site, f"{a:%Y-%m}", status.get("pages", 0),
+                 status.get("links", 0), "" if status["complete"] else " (INCOMPLETE: will retry next run)")
+        if status["complete"]:
+            rows = [{"url": c.url, "title": c.title_hint, "date": c.date.isoformat() if c.date else None,
+                     "precision": c.precision, "date_source": c.date_source} for c in found]
+            fetcher._cache_put(key, Page(json.dumps(rows).encode("utf-8"), "application/json", "js"))
+
+
+PIB_FIELDS = ("ctl00$ContentPlaceHolder1$ddlMinistry", "ctl00$ContentPlaceHolder1$ddlYear",
+              "ctl00$ContentPlaceHolder1$ddlMonth", "ctl00$ContentPlaceHolder1$ddlday")
+
+
+def _set_select(page, name, value) -> None:
+    """Choose an option in a drop-down that reloads the page when changed (ASP.NET postback)."""
+    loc = page.locator(f'select[name="{name}"]')
+    if loc.input_value() == value:
+        return
+    try:
+        with page.expect_navigation(timeout=45000):
+            loc.select_option(value)
+    except Exception:  # the page may refresh without a full navigation
+        page.wait_for_load_state("networkidle", timeout=45000)
+    page.wait_for_timeout(600)
+
+
+def _pib_select(page, fetcher, ministry, year, month) -> bool:
+    wanted = dict(zip(PIB_FIELDS, (str(ministry), str(year), str(month), "0")))
+    for attempt in range(2):
+        for name, value in wanted.items():
+            fetcher._throttle("www.pib.gov.in", max(fetcher.delay, 2))
+            _set_select(page, name, value)
+        if all(page.locator(f'select[name="{n}"]').input_value() == v for n, v in wanted.items()):
+            return True
+    return False
+
+
+def discover_pib_form(src, fetcher, start, end, max_pages):
+    """India PIB: in the browser, pick each ministry, year and month in the form and read the list
+    (one page per month). Finished ministry-months are remembered in the cache."""
+    if not fetcher.use_js:
+        log.warning("  %s needs --js (its lists are chosen with drop-down menus)", src.site)
+        fetcher.last_reason.value = "needs_js"
+        return
+    ministries = src.options.get("ministries", {"30": False})
+    page, loaded = None, False
+    try:
+        for code, title_only in ministries.items():
+            kept_months = 0
+            for a, _ in month_windows(start, end):
+                key = f"pibform://{code}/{a:%Y-%m}"
+                done = fetcher._cache_get(key, None)
+                if done is not None:
+                    for d in json.loads(done.text):
+                        yield Candidate(d["url"], d["title"], iso_date(d["date"]), "day", "listing page",
+                                        prefilter=title_only)
+                    continue
+                if not loaded:
+                    page = fetcher.new_browser_page()
+                    page.goto(src.url, wait_until="networkidle", timeout=90000)
+                    _dismiss_cookies(page)
+                    loaded = True
+                if not _pib_select(page, fetcher, code, a.year, a.month):
+                    log.warning("  PIB: could not select ministry %s, %s; skipped (will retry next run)",
+                                code, f"{a:%Y-%m}")
+                    continue
+                html = page.content()
+                if looks_blocked(200, html.encode("utf-8")):
+                    log.warning("  PIB: bot check; stopping")
+                    return
+                links = extract_links(html, src.url, src)
+                m = re.search(r"Displaying\s+(\d+)\s+Press Releases", BeautifulSoup(html, "lxml").get_text(" "))
+                if m and int(m.group(1)) != len(links):
+                    log.info("  PIB ministry %s %s: page says %s releases, %d links read",
+                             code, f"{a:%Y-%m}", m.group(1), len(links))
+                for c in links:
+                    c.prefilter = title_only
+                    yield c
+                kept_months += 1
+                fetcher._cache_put(key, Page(json.dumps(
+                    [{"url": c.url, "title": c.title_hint, "date": c.date.isoformat() if c.date else None}
+                     for c in links]).encode("utf-8"), "application/json", "js"))
+            log.info("  PIB ministry %s: %d new months read", code, kept_months)
+    finally:
+        if page is not None:
+            page.close()
+
+
+STRATEGIES = {"pib_form": discover_pib_form, "js_clicks": discover_js_clicks, "auto": discover_auto, "listing": discover_listing, "govuk_api": discover_govuk,
               "hk_daily": discover_hk_daily, "wayback": discover_wayback,
               "federal_register": discover_federal_register, "manual": discover_manual,
               "sitemap": lambda s, f, a, b, m: discover_sitemap(s, f, a, b)}
@@ -1186,12 +1443,35 @@ def extract(page: Page, url: str):
     return meta
 
 
+def visible_date(html: str, title: str = "") -> dt.date | None:
+    """The date printed near the headline (just before or after it), as a reader sees it."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        for t in soup(["script", "style", "noscript", "header", "nav", "footer"]):
+            t.decompose()
+        full = " ".join(soup.get_text(" ", strip=True).split())
+        h1 = soup.find("h1")
+        anchor = (h1.get_text(" ", strip=True) if h1 else "") or title
+        idx = full.find(anchor[:60]) if anchor else -1
+        if idx < 0:
+            return None
+        return date_from_text(full[idx: idx + 700]) or date_from_text(full[max(0, idx - 250): idx])
+    except Exception:
+        return None
+
+
 def resolve_date(cand: Candidate, meta: dict):
     url_d, url_prec = date_from_url(cand.url)
     if url_d and url_prec == "day":
         return url_d, "url"
     if cand.date and cand.date_source in ("GOV.UK API", "daily index", "signing date", "publication date", "manual list"):
         return cand.date, cand.date_source
+    # a date printed beside the item in the list, or next to the headline, beats hidden
+    # page metadata (which is often a "last modified" date)
+    if cand.date and cand.precision == "day" and cand.date_source == "listing page":
+        return cand.date, cand.date_source
+    if meta.get("visible_date"):
+        return meta["visible_date"], "date shown on page"
     if (md := iso_date(meta.get("date"))):
         return md, "page metadata"
     if cand.date and cand.precision == "day":
@@ -1208,25 +1488,33 @@ def run_source(src: Source, fetcher: Fetcher, keywords, start, end, max_pages, l
     records = []
     discover = STRATEGIES.get(src.strategy, discover_auto)
     seen = set()
+    last_note = time.time()
     try:
         for cand in discover(src, fetcher, start, end, max_pages):
             if cand.url in seen:
                 continue
             seen.add(cand.url)
             stats["candidates"] += 1
+            if stats["candidates"] % 50 == 0 or time.time() - last_note > 300:  # heartbeat
+                last_note = time.time()
+                newest = max((r["date"] for r in records if r["date"]), default=None)
+                log.info("  ...%s still working: %d links checked, %d articles read, %d kept%s",
+                         src.site, stats["candidates"], stats["fetched_articles"], stats["kept"],
+                         f" (latest kept: {newest})" if newest else "")
             if outside_range(cand.date, cand.precision, start, end) and cand.date_source != "first archive capture":
                 stats["skipped_out_of_range"] += 1
                 continue
             if cand.date_source == "first archive capture" and cand.date and cand.date < start - dt.timedelta(days=60):
                 stats["skipped_out_of_range"] += 1
                 continue
-            if (src.title_prefilter or src.slug_prefilter) and cand.title_hint \
+            if (src.title_prefilter or src.slug_prefilter or cand.prefilter) and cand.title_hint \
                     and not match_keywords(cand.title_hint, keywords)["distinct"]:
                 stats["skipped_title_prefilter"] += 1
                 continue
             if limit and stats["fetched_articles"] >= limit:
                 break
-            page = fetcher.get(cand.fetch_url or cand.url, render_js=src.render_js, when=cand.date)
+            page = fetcher.get(cand.fetch_url or cand.url, render_js=src.render_js or url_needs_js(cand.url),
+                               when=cand.date)
             if not page:
                 reason = fetcher.last_reason.value or "failed"
                 stats["blocked" if reason in ("blocked", "http_403") else f"fetch_{reason}"] += 1
@@ -1235,6 +1523,8 @@ def run_source(src: Source, fetcher: Fetcher, keywords, start, end, max_pages, l
             if page.via.endswith("wayback"):
                 stats["via_wayback"] += 1
             meta = extract(page, cand.url)
+            if not page.is_pdf:
+                meta["visible_date"] = visible_date(page.text, meta.get("title") or cand.title_hint)
             title = (meta.get("title") or cand.title_hint or "").strip()
             if cand.title_hint and src.strategy in ("federal_register", "govuk_api"):
                 title = cand.title_hint
@@ -1242,6 +1532,8 @@ def run_source(src: Source, fetcher: Fetcher, keywords, start, end, max_pages, l
             date, date_src = resolve_date(cand, meta)
             if date and not (start <= date <= end):
                 stats["dropped_out_of_range"] += 1
+                if stats["dropped_out_of_range"] <= 3:
+                    log.info("  (out of range) %s dated %s from %s: %s", src.site, date, date_src, cand.url[:90])
                 continue
             if len(text.split()) < 30:
                 stats["dropped_empty_text"] += 1
@@ -1283,7 +1575,8 @@ def probe(sources, fetcher, start, end, out_path: Path):
                "enabled": src.enabled, "notes": src.notes}
         if not src.enabled:
             row.update(status="disabled", links_found=0)
-        elif src.strategy in ("govuk_api", "hk_daily", "federal_register", "wayback", "manual"):
+        elif src.strategy in ("govuk_api", "hk_daily", "federal_register", "wayback", "manual", "js_clicks",
+                              "pib_form"):
             if src.strategy == "wayback":
                 gen = discover_wayback(src, fetcher, start, end, 1, cdx_limit=50)
             elif src.strategy == "hk_daily":
