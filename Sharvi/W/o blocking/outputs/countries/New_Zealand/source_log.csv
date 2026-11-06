@@ -1,0 +1,4 @@
+country,source_type,url,strategy,enabled,candidates,fetched_articles,kept,blocked,via_wayback,skipped_out_of_range,skipped_title_prefilter,dropped_out_of_range,dropped_empty_text,dropped_no_keywords,fetch_needs_js,fetch_failed,error_msg,notes
+New Zealand,Ministry of Environment,https://environment.govt.nz/news/,auto,True,29,28,13,,,,,14,,1,,,,
+New Zealand,Govt press release,https://www.dpmc.govt.nz/media-centre,auto,True,441,438,58,2.0,438.0,1.0,,318,,62,,,,
+New Zealand,Govt press release,https://www.beehive.govt.nz/releases,listing,True,4509,2500,188,1938.0,2499.0,71.0,,2026,1.0,285,,,,"?page=N zero-based, ~10 per page"

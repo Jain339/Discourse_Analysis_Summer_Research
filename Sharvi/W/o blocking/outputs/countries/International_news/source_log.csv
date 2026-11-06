@@ -1,0 +1,13 @@
+country,source_type,url,strategy,enabled,candidates,fetched_articles,kept,blocked,via_wayback,skipped_out_of_range,skipped_title_prefilter,dropped_out_of_range,dropped_empty_text,dropped_no_keywords,fetch_needs_js,fetch_failed,error_msg,notes
+International (news),News,https://www.reuters.com/business/energy/,auto,True,,,,,,,,,,,,,,
+International (news),News,https://www.reuters.com/business/environment/,auto,True,,,,,,,,,,,,,,
+International (news),News,https://www.reuters.com/markets/carbon/,auto,True,,,,,,,,,,,,,,
+International (news),News,https://www.reuters.com/sustainability/,auto,True,,,,,,,,,,,,,,
+International (news),News,https://www.scmp.com/news/china,auto,True,39.0,6.0,,,,33.0,,6.0,,,,,,
+International (news),News,https://www.nytimes.com/section/business/energy-environment,auto,True,20.0,10.0,1.0,,4.0,10.0,,2.0,2.0,5.0,,,,
+International (news),News,https://www.nytimes.com/section/climate,auto,True,37.0,14.0,8.0,21.0,2.0,2.0,,1.0,,5.0,,,,
+International (news),News,https://www.bbc.com/future-planet/solutions,auto,True,43.0,37.0,10.0,,,6.0,,12.0,,15.0,,,,
+International (news),News,https://www.bbc.com/future-planet/green-living,auto,True,44.0,42.0,19.0,,,2.0,,8.0,,15.0,,,,
+International (news),News,https://www.bbc.com/future-planet/sustainable-business,auto,True,42.0,41.0,8.0,,,1.0,,17.0,,16.0,,,,
+International (news),News,https://www.lemonde.fr/en/environment/,auto,True,141.0,51.0,6.0,,,90.0,,43.0,,2.0,,,,
+International (news),News,https://www.washingtonpost.com/climate-environment/,auto,True,86.0,47.0,31.0,,44.0,7.0,,,2.0,14.0,,32.0,,

@@ -1,0 +1,7 @@
+country,source_type,url,strategy,enabled,candidates,fetched_articles,kept,blocked,via_wayback,skipped_out_of_range,skipped_title_prefilter,dropped_out_of_range,dropped_empty_text,dropped_no_keywords,fetch_needs_js,fetch_failed,error_msg,notes
+India,Ministry of Environment,https://www.pib.gov.in/newsite/pmreleases.aspx?mincode=30&reg=48&lang=2,auto,False,,,,,,,,,,,,,disabled,Covered by the Allrel.aspx source (all ministries' releases).
+India,Govt press release,https://www.pib.gov.in/Allrel.aspx?reg=48&lang=1,pib_form,True,355.0,349.0,115.0,,,1.0,,,14.0,220.0,,5.0,"Locator.input_value: Timeout 30000ms exceeded.
+Call log:
+  - waiting for locator(""select[name=\""ctl00$ContentPlaceHolder1$ddlday\""]"")
+",PIB: the browser picks each ministry and month in the form (--js).
+India,Ministry of Environment,https://moef.gov.in/press_release/update,auto,True,2.0,1.0,1.0,,,1.0,,,,,,,,
